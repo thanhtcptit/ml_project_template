@@ -1,0 +1,11 @@
+# local package
+-e .
+
+# external requirements
+boto3
+click
+flake8
+jsonnet
+overrides
+python-dotenv>=0.5.1
+tqdm
