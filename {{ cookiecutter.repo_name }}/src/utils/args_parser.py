@@ -35,4 +35,4 @@ class Subcommand:
     """
     def add_subparser(self, name: str, parser: argparse._SubParsersAction) \
             -> argparse.ArgumentParser:
-        raise NotImplementedError
+        raise NotImplementedError()

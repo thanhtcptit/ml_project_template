@@ -2,4 +2,4 @@
 
 
 def main(dataset_path, checkpoint_path, force=False):
-    raise NotImplementedError
+    raise NotImplementedError()

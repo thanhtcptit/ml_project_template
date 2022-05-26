@@ -31,9 +31,6 @@ $ conda install cookiecutter
 The directory structure of your new project looks like this: 
 
 ```
-├── LICENSE
-├── README.md                   <- The top-level README for developers using this project
-│
 ├── configs                     <- Store experiment config files
 │
 ├── data
@@ -53,22 +50,14 @@ The directory structure of your new project looks like this:
 ├── reports                     <- Generated analysis as HTML, PDF, LaTeX, etc
 │   └── figures                 <- Generated graphics and figures to be used in reporting
 │   
-├── requirements.txt            <- The requirements file for reproducing the analysis environment, e.g.
-│                                  generated with `pip freeze > requirements.txt`
-│   
-├── setup.py                    <- Makes project pip installable (pip install -e .) so src can be imported
 ├── src                         <- Source code for use in this project.
-│   ├── __init__.py             <- Makes src a Python module
-│   ├── evaluate.py             <- Script to evaluate models
-│   ├── export.py               <- Script to export model for serving
-│   ├── hyperparams_search.py   <- Script to perform hyperparameter search
-│   ├── train.py                <- Script to train models
+│   ├── __init__.py
+│   ├── evaluate.py
+│   ├── train.py
 │   │
 │   ├── data                    <- Scripts to download or generate data
-│   │   └── preprocess_dataset.py
 │   │
 │   ├── features                <- Scripts to turn raw data into features for modeling
-│   │   └── build_features.py
 │   │
 │   ├── models                  <- Scripts to define models
 │   │   └── base.py
@@ -76,9 +65,16 @@ The directory structure of your new project looks like this:
 │   ├── utils                   <- Scripts to define helper function
 │   │
 │   └── visualization           <- Scripts to create exploratory and results oriented visualizations
-│       └── visualize.py
 │
-└── tox.ini                     <- tox file with settings for running tox; see tox.readthedocs.io
+├── LICENSE
+│
+├── README.md                   <- The top-level README for developers using this project
+│
+├── requirements.txt            <- The requirements file for reproducing the analysis environment, e.g.
+│                                  generated with `pip freeze > requirements.txt`
+└── run.py                      <- Script to run tasks
+│   
+├── setup.py                    <- Makes project pip installable (pip install -e .) so src can be imported
 ```
 
 ### Installing development requirements

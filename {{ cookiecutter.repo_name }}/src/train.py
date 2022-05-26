@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
 
 
-def main(params, checkpoint_dir, recover=True, force=False):
-    raise NotImplementedError
+def main(config_path, checkpoint_dir, recover=True, force=False):
+    raise NotImplementedError()

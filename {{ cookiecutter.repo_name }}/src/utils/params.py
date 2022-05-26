@@ -2,17 +2,25 @@
 import os
 import copy
 import json
+import boto3
+import shutil
 import inspect
 import logging
+import requests
+import tempfile
 
+from tqdm import tqdm
+from pathlib import Path
+from hashlib import sha256
+from functools import wraps
 from overrides import overrides
+from urllib.parse import urlparse
 from collections import defaultdict
-from typing import Any, Dict, List, TypeVar, Type, Union, cast, Tuple, Set
+from botocore.exceptions import ClientError
 from collections import MutableMapping, OrderedDict
+from typing import Any, Dict, List, Set, TypeVar, Type, Union, cast, Optional, Tuple, IO, Callable
 
-from src.utils.file_utils import cached_path
 
-# _jsonnet doesn't work on Windows, so we have to use fakes.
 try:
     from _jsonnet import evaluate_file, evaluate_snippet
 except ImportError:
@@ -25,13 +33,14 @@ except ImportError:
         logger.warning(f"_jsonnet not loaded, treating snippet as json")
         return expr
 
-logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
-# If a function parameter has no default value specified,
-# this is what the inspect module returns.
-_NO_DEFAULT = inspect.Parameter.empty  # pylint: disable=invalid-name
+_NO_DEFAULT = inspect.Parameter.empty
+
+CACHE_ROOT = Path(os.getenv('CACHE_ROOT', Path.home() / '.cache_root'))
+CACHE_DIRECTORY = str(CACHE_ROOT / "cache")
 
 
 class ConfigurationError(Exception):
@@ -43,13 +52,161 @@ class ConfigurationError(Exception):
         return repr(self.message)
 
 
+def url_to_filename(url: str, etag: str = None) -> str:
+    url_bytes = url.encode('utf-8')
+    url_hash = sha256(url_bytes)
+    filename = url_hash.hexdigest()
+
+    if etag:
+        etag_bytes = etag.encode('utf-8')
+        etag_hash = sha256(etag_bytes)
+        filename += '.' + etag_hash.hexdigest()
+
+    return filename
+
+
+def filename_to_url(filename: str, cache_dir: str = None) -> Tuple[str, str]:
+    if cache_dir is None:
+        cache_dir = CACHE_DIRECTORY
+
+    cache_path = os.path.join(cache_dir, filename)
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError("file {} not found".format(cache_path))
+
+    meta_path = cache_path + '.json'
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError("file {} not found".format(meta_path))
+
+    with open(meta_path) as meta_file:
+        metadata = json.load(meta_file)
+    url = metadata['url']
+    etag = metadata['etag']
+
+    return url, etag
+
+
+def cached_path(url_or_filename: Union[str, Path], cache_dir: str = None) -> str:
+    if cache_dir is None:
+        cache_dir = CACHE_DIRECTORY
+    if isinstance(url_or_filename, Path):
+        url_or_filename = str(url_or_filename)
+
+    url_or_filename = os.path.expanduser(url_or_filename)
+    parsed = urlparse(url_or_filename)
+
+    if parsed.scheme in ('http', 'https', 's3'):
+        return get_from_cache(url_or_filename, cache_dir)
+    elif os.path.exists(url_or_filename):
+        return url_or_filename
+    elif parsed.scheme == '':
+        raise FileNotFoundError("file {} not found".format(url_or_filename))
+    else:
+        raise ValueError(
+            "unable to parse {} as a URL or as a local path".format(url_or_filename))
+
+
+def split_s3_path(url: str) -> Tuple[str, str]:
+    parsed = urlparse(url)
+    if not parsed.netloc or not parsed.path:
+        raise ValueError("bad s3 path {}".format(url))
+    bucket_name = parsed.netloc
+    s3_path = parsed.path
+    if s3_path.startswith("/"):
+        s3_path = s3_path[1:]
+    return bucket_name, s3_path
+
+
+def s3_request(func: Callable):
+    @wraps(func)
+    def wrapper(url: str, *args, **kwargs):
+        try:
+            return func(url, *args, **kwargs)
+        except ClientError as exc:
+            if int(exc.response["Error"]["Code"]) == 404:
+                raise FileNotFoundError("file {} not found".format(url))
+            else:
+                raise
+
+    return wrapper
+
+
+@s3_request
+def s3_etag(url: str) -> Optional[str]:
+    s3_resource = boto3.resource("s3")
+    bucket_name, s3_path = split_s3_path(url)
+    s3_object = s3_resource.Object(bucket_name, s3_path)
+    return s3_object.e_tag
+
+
+@s3_request
+def s3_get(url: str, temp_file: IO) -> None:
+    s3_resource = boto3.resource("s3")
+    bucket_name, s3_path = split_s3_path(url)
+    s3_resource.Bucket(bucket_name).download_fileobj(s3_path, temp_file)
+
+
+def http_get(url: str, temp_file: IO) -> None:
+    req = requests.get(url, stream=True)
+    content_length = req.headers.get('Content-Length')
+    total = int(content_length) if content_length is not None else None
+    progress = tqdm(unit="B", total=total)
+    for chunk in req.iter_content(chunk_size=1024):
+        if chunk:
+            progress.update(len(chunk))
+            temp_file.write(chunk)
+    progress.close()
+
+
+def get_from_cache(url: str, cache_dir: str = None) -> str:
+    if cache_dir is None:
+        cache_dir = CACHE_DIRECTORY
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    if url.startswith("s3://"):
+        etag = s3_etag(url)
+    else:
+        response = requests.head(url, allow_redirects=True)
+        if response.status_code != 200:
+            raise IOError("HEAD request failed for url {} with status code {}"
+                          .format(url, response.status_code))
+        etag = response.headers.get("ETag")
+
+    filename = url_to_filename(url, etag)
+
+    cache_path = os.path.join(cache_dir, filename)
+
+    if not os.path.exists(cache_path):
+        with tempfile.NamedTemporaryFile() as temp_file:
+            logger.info("%s not found in cache, downloading to %s",
+                        url, temp_file.name)
+
+            if url.startswith("s3://"):
+                s3_get(url, temp_file)
+            else:
+                http_get(url, temp_file)
+
+            temp_file.flush()
+            temp_file.seek(0)
+
+            logger.info("copying %s to cache at %s",
+                        temp_file.name, cache_path)
+            with open(cache_path, 'wb') as cache_file:
+                shutil.copyfileobj(temp_file, cache_file)
+
+            logger.info("creating metadata file for %s", cache_path)
+            meta = {'url': url, 'etag': etag}
+            meta_path = cache_path + '.json'
+            with open(meta_path, 'w') as meta_file:
+                json.dump(meta, meta_file)
+
+            logger.info("removing temp file %s", temp_file.name)
+
+    return cache_path
+
+
+
 def unflatten(flat_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Given a "flattened" dict with compound keys, e.g.
-        {"a.b": 0}
-    unflatten it:
-        {"a": {"b": 0}}
-    """
     unflat: Dict[str, Any] = {}
 
     for compound_key, value in flat_dict.items():
@@ -73,9 +230,6 @@ def unflatten(flat_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def with_fallback(preferred: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Deep merge two dicts, preferring values from `preferred`.
-    """
     preferred_keys = set(preferred.keys())
     fallback_keys = set(fallback.keys())
     common_keys = preferred_keys & fallback_keys
@@ -108,30 +262,6 @@ def parse_overrides(serialized_overrides: str) -> Dict[str, Any]:
 
 
 class Params(MutableMapping):
-    """
-    Represents a parameter dictionary with a history, and contains other functionality around
-    parameter passing and validation for AllenNLP.
-
-    There are currently two benefits of a ``Params`` object over a plain dictionary for parameter
-    passing:
-
-    #. We handle a few kinds of parameter validation, including making sure that parameters
-       representing discrete choices actually have acceptable values, and making sure no extra
-       parameters are passed.
-    #. We log all parameter reads, including default values.  This gives a more complete
-       specification of the actual parameters used than is given in a JSON file, because
-       those may not specify what default values were used, whereas this will log them.
-
-    The convention for using a ``Params`` object in AllenNLP is that you will consume the parameters
-    as you read them, so that there are none left when you've read everything you expect.  This
-    lets us easily validate that you didn't pass in any `extra` parameters, just by making sure
-    that the parameter dictionary is empty.  You should do this when you're done handling
-    parameters, by calling :func:`Params.assert_empty`.
-    """
-
-    # This allows us to check for the presence of "None" as a default argument,
-    # which we require because we make a distinction bewteen passing a value of "None"
-    # and passing no value to the default parameter of "pop".
     DEFAULT = object()
 
     def __init__(self,
@@ -145,40 +275,12 @@ class Params(MutableMapping):
         self.files_to_archive = {} if files_to_archive is None else files_to_archive
 
     def add_file_to_archive(self, name: str) -> None:
-        """
-        Any class in its ``from_params`` method can request that some of its
-        input files be added to the archive by calling this method.
-
-        For example, if some class ``A`` had an ``input_file`` parameter, it could call
-
-        ```
-        params.add_file_to_archive("input_file")
-        ```
-
-        which would store the supplied value for ``input_file`` at the key
-        ``previous.history.and.then.input_file``. The ``files_to_archive`` dict
-        is shared with child instances via the ``_check_is_dict`` method, so that
-        the final mapping can be retrieved from the top-level ``Params`` object.
-
-        NOTE: You must call ``add_file_to_archive`` before you ``pop()``
-        the parameter, because the ``Params`` instance looks up the value
-        of the filename inside itself.
-
-        If the ``loading_from_archive`` flag is True, this will be a no-op.
-        """
         if not self.loading_from_archive:
             self.files_to_archive[f"{self.history}{name}"] = cached_path(
                 self.get(name))
 
     @overrides
     def pop(self, key: str, default: Any = DEFAULT) -> Any:
-        """
-        Performs the functionality associated with dict.pop(key), along with checking for
-        returned dictionaries, replacing them with Param objects with an updated history.
-
-        If ``key`` is not present in the dictionary, and no default was specified, we raise a
-        ``ConfigurationError``, instead of the typical ``KeyError``.
-        """
         if default is self.DEFAULT:
             try:
                 value = self.params.pop(key)
@@ -188,14 +290,10 @@ class Params(MutableMapping):
         else:
             value = self.params.pop(key, default)
         if not isinstance(value, dict):
-            logger.info(self.history + key + " = " +
-                        str(value))  # type: ignore
+            logger.info(self.history + key + " = " + str(value))
         return self._check_is_dict(key, value)
 
     def pop_int(self, key: str, default: Any = DEFAULT) -> int:
-        """
-        Performs a pop and coerces to an int.
-        """
         value = self.pop(key, default)
         if value is None:
             return None
@@ -203,9 +301,6 @@ class Params(MutableMapping):
             return int(value)
 
     def pop_float(self, key: str, default: Any = DEFAULT) -> float:
-        """
-        Performs a pop and coerces to a float.
-        """
         value = self.pop(key, default)
         if value is None:
             return None
@@ -213,9 +308,6 @@ class Params(MutableMapping):
             return float(value)
 
     def pop_bool(self, key: str, default: Any = DEFAULT) -> bool:
-        """
-        Performs a pop and coerces to a bool.
-        """
         value = self.pop(key, default)
         if value is None:
             return None
@@ -230,10 +322,6 @@ class Params(MutableMapping):
 
     @overrides
     def get(self, key: str, default: Any = DEFAULT):
-        """
-        Performs the functionality associated with dict.get(key) but also checks for returned
-        dicts and returns a Params object in their place with an updated history.
-        """
         if default is self.DEFAULT:
             try:
                 value = self.params.get(key)
@@ -246,29 +334,6 @@ class Params(MutableMapping):
 
     def pop_choice(self, key: str, choices: List[Any],
                    default_to_first_choice: bool = False) -> Any:
-        """
-        Gets the value of ``key`` in the ``params`` dictionary, ensuring that the value is one of
-        the given choices. Note that this `pops` the key from params, modifying the dictionary,
-        consistent with how parameters are processed in this codebase.
-
-        Parameters
-        ----------
-        key: str
-            Key to get the value from in the param dictionary
-        choices: List[Any]
-            A list of valid options for values corresponding to ``key``.  For example, if you're
-            specifying the type of encoder to use for some part of your model, the choices might be
-            the list of encoder classes we know about and can instantiate.  If the value we find in
-            the param dictionary is not in ``choices``, we raise a ``ConfigurationError``, because
-            the user specified an invalid value in their parameter file.
-        default_to_first_choice: bool, optional (default=False)
-            If this is ``True``, we allow the ``key`` to not be present in the parameter
-            dictionary.  If the key is not present, we will use the return as the value the first
-            choice in the ``choices`` list.  If this is ``False``, we raise a
-            ``ConfigurationError``, because specifying the ``key`` is required (e.g., you `have` to
-            specify your model class when running an experiment, but you can feel free to use
-            default settings for encoders if you want).
-        """
         default = choices[0] if default_to_first_choice else self.DEFAULT
         value = self.pop(key, default)
         if value not in choices:
@@ -279,15 +344,6 @@ class Params(MutableMapping):
         return value
 
     def as_dict(self, quiet=False):
-        """
-        Sometimes we need to just represent the parameters as a dict, for instance when we pass
-        them to a Keras layer(so that they can be serialised).
-
-        Parameters
-        ----------
-        quiet: bool, optional (default = False)
-            Whether to log the parameters before returning them as a dict.
-        """
         if quiet:
             return self.params
 
@@ -307,10 +363,6 @@ class Params(MutableMapping):
         return self.params
 
     def as_flat_dict(self):
-        """
-        Returns the parameters of a flat dictionary from keys to values.
-        Nested structure is collapsed with periods.
-        """
         flat_params = {}
 
         def recurse(parameters, path):
@@ -325,19 +377,9 @@ class Params(MutableMapping):
         return flat_params
 
     def duplicate(self) -> 'Params':
-        """
-        Uses ``copy.deepcopy()`` to create a duplicate (but fully distinct)
-        copy of these Params.
-        """
         return Params(copy.deepcopy(self.params))
 
     def assert_empty(self, class_name: str):
-        """
-        Raises a ``ConfigurationError`` if ``self.params`` is not empty.  We take ``class_name`` as
-        an argument so that the error message gives some idea of where an error happened, if there
-        was one.  ``class_name`` should be the name of the `calling` class, the one that got extra
-        parameters (if there are any).
-        """
         if self.params:
             raise ConfigurationError(
                 "Extra parameters passed to {}: {}".format(class_name, self.params))
@@ -374,27 +416,9 @@ class Params(MutableMapping):
 
     @staticmethod
     def from_file(params_file: str, params_overrides: str = "", ext_vars: dict = None) -> 'Params':
-        """
-        Load a `Params` object from a configuration file.
-
-        Parameters
-        ----------
-        params_file : ``str``
-            The path to the configuration file to load.
-        params_overrides : ``str``, optional
-            A dict of overrides that can be applied to final object.
-            e.g. {"model.embedding_dim": 10}
-        ext_vars : ``dict``, optional
-            Our config files are Jsonnet, which allows specifying external variables
-            for later substitution. Typically we substitute these using environment
-            variables; however, you can also specify them here, in which case they
-            take priority over environment variables.
-            e.g. {"HOME_DIR": "/Users/allennlp/home"}
-        """
         if ext_vars is None:
             ext_vars = {}
 
-        # redirect to cache, if necessary
         params_file = cached_path(params_file)
         ext_vars = {**dict(os.environ), **ext_vars}
 
@@ -412,18 +436,6 @@ class Params(MutableMapping):
                 preference_orders), handle, indent=4)
 
     def as_ordered_dict(self, preference_orders: List[List[str]] = None) -> OrderedDict:
-        """
-        Returns Ordered Dict of Params from list of partial order preferences.
-
-        Parameters
-        ----------
-        preference_orders: List[List[str]], optional
-            ``preference_orders`` is list of partial preference orders. ["A", "B", "C"] means
-            "A" > "B" > "C". For multiple preference_orders first will be considered first.
-            Keys not found, will have last but alphabetical preference. Default Preferences:
-            ``[["dataset_reader", "iterator", "model", "train_data_path", "validation_data_path",
-            "test_data_path", "trainer", "vocabulary"], ["type"]]``
-        """
         params_dict = self.as_dict(quiet=True)
         if not preference_orders:
             preference_orders = []
@@ -433,16 +445,11 @@ class Params(MutableMapping):
             preference_orders.append(["type"])
 
         def order_func(key):
-            # Makes a tuple to use for ordering.  The tuple is an index into each of the
-            # `preference_orders`, followed by the key itself.  This gives us integer sorting if
-            # you have a key in one of the `preference_orders`, followed by alphabetical ordering
-            # if not.
             order_tuple = [order.index(key) if key in order else len(
                 order) for order in preference_orders]
             return order_tuple + [key]
 
         def order_dict(dictionary, order_func):
-            # Recursively orders dictionary according to scoring order_func
             result = OrderedDict()
             for key, val in sorted(dictionary.items(), key=lambda item: order_func(item[0])):
                 result[key] = order_dict(
@@ -457,16 +464,6 @@ def pop_choice(params: Dict[str, Any],
                choices: List[Any],
                default_to_first_choice: bool = False,
                history: str = "?.") -> Any:
-    """
-    Performs the same function as :func:`Params.pop_choice`, but is required in order to deal with
-    places that the Params object is not welcome, such as inside Keras layers.  See the docstring
-    of that method for more detail on how this function works.
-
-    This method adds a ``history`` parameter, in the off-chance that you know it, so that we can
-    reproduce :func:`Params.pop_choice` exactly.  We default to using "?." if you don't know the
-    history, so you'll have to fix that in the log if you want to actually recover the logged
-    parameters.
-    """
     value = Params(params, history).pop_choice(
         key, choices, default_to_first_choice)
     return value
@@ -482,12 +479,6 @@ def _replace_none(dictionary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def takes_arg(obj, arg: str) -> bool:
-    """
-    Checks whether the provided obj takes a certain arg.
-    If it's a class, we're really checking whether its constructor does.
-    If it's a function or method, we're checking the object itself.
-    Otherwise, we raise an error.
-    """
     if inspect.isclass(obj):
         signature = inspect.signature(obj.__init__)
     elif inspect.ismethod(obj) or inspect.isfunction(obj):
@@ -498,11 +489,6 @@ def takes_arg(obj, arg: str) -> bool:
 
 
 def remove_optional(annotation: type):
-    """
-    Optional[X] annotations are actually represented as Union[X, NoneType].
-    For our purposes, the "Optional" part is not interesting, so here we
-    throw it away.
-    """
     origin = getattr(annotation, '__origin__', None)
     args = getattr(annotation, '__args__', ())
     if origin == Union and len(args) == 2 and isinstance(None, args[1]):
@@ -512,76 +498,42 @@ def remove_optional(annotation: type):
 
 
 def create_kwargs(cls: Type[T], params: Params, **extras) -> Dict[str, Any]:
-    """
-    Given some class, a `Params` object, and potentially other keyword arguments,
-    create a dict of keyword args suitable for passing to the class's constructor.
-
-    The function does this by finding the class's constructor, matching the constructor
-    arguments to entries in the `params` object, and instantiating values for the parameters
-    using the type annotation and possibly a from_params method.
-
-    Any values that are provided in the `extras` will just be used as is.
-    For instance, you might provide an existing `Vocabulary` this way.
-    """
-    # Get the signature of the constructor.
     signature = inspect.signature(cls.__init__)
     kwargs: Dict[str, Any] = {}
 
-    # Iterate over all the constructor parameters and their annotations.
     for name, param in signature.parameters.items():
-        # Skip "self". You're not *required* to call the first parameter "self",
-        # so in theory this logic is fragile, but if you don't call the self parameter
-        # "self" you kind of deserve what happens.
         if name == "self":
             continue
 
-        # If the annotation is a compound type like typing.Dict[str, int],
-        # it will have an __origin__ field indicating `typing.Dict`
-        # and an __args__ field indicating `(str, int)`. We capture both.
         annotation = remove_optional(param.annotation)
         origin = getattr(annotation, '__origin__', None)
         args = getattr(annotation, '__args__', [])
 
-        # The parameter is optional if its default value is not the "no default" sentinel.
         default = param.default
         optional = default != _NO_DEFAULT
 
-        # Some constructors expect extra non-parameter items, e.g. vocab: Vocabulary.
-        # We check the provided `extras` for these and just use them if they exist.
         if name in extras:
             kwargs[name] = extras[name]
 
-        # The next case is when the parameter type is itself constructible from_params.
         elif hasattr(annotation, 'from_params'):
             if name in params:
-                # Our params have an entry for this, so we use that.
                 subparams = params.pop(name)
 
                 if takes_arg(annotation.from_params, 'extras'):
-                    # If annotation.params accepts **extras, we need to pass them all along.
-                    # For example, `BasicTextFieldEmbedder.from_params` requires a Vocabulary
-                    # object, but `TextFieldEmbedder.from_params` does not.
                     subextras = extras
                 else:
-                    # Otherwise, only supply the ones that are actual args; any additional ones
-                    # will cause a TypeError.
                     subextras = {k: v for k, v in extras.items(
                     ) if takes_arg(annotation.from_params, k)}
 
-                # In some cases we allow a string instead of a param dict, so
-                # we need to handle that case separately.
                 if isinstance(subparams, str):
                     kwargs[name] = annotation.by_name(subparams)()
                 else:
                     kwargs[name] = annotation.from_params(params=subparams, **subextras)
             elif not optional:
-                # Not optional and not supplied, that's an error!
                 raise ConfigurationError(f"expected key {name} for {cls.__name__}")
             else:
                 kwargs[name] = default
 
-        # If the parameter type is a Python primitive, just pop it off
-        # using the correct casting pop_xyz operation.
         elif annotation == str:
             kwargs[name] = (params.pop(name, default)
                             if optional
@@ -599,10 +551,6 @@ def create_kwargs(cls: Type[T], params: Params, **extras) -> Dict[str, Any]:
                             if optional
                             else params.pop_float(name))
 
-        # This is special logic for handling types like Dict[str, TokenIndexer],
-        # List[TokenIndexer], Tuple[TokenIndexer, Tokenizer], and Set[TokenIndexer],
-        # which it creates by instantiating each value from_params and returning the resulting
-        # structure.
         elif origin in (Dict, dict) and len(args) == 2 and hasattr(args[-1], 'from_params'):
             value_cls = annotation.__args__[-1]
 
@@ -642,7 +590,6 @@ def create_kwargs(cls: Type[T], params: Params, **extras) -> Dict[str, Any]:
             kwargs[name] = value_set
 
         else:
-            # Pass it on as is and hope for the best.   ¯\_(ツ)_/¯
             if optional:
                 kwargs[name] = params.pop(name, default)
             else:
@@ -652,26 +599,12 @@ def create_kwargs(cls: Type[T], params: Params, **extras) -> Dict[str, Any]:
     return kwargs
 
 
-class FromParams:
-    """
-    Mixin to give a from_params method to classes. We create a distinct base class for this
-    because sometimes we want non-Registrable classes to be instantiatable from_params.
-    """
+class Registrable:
+    _registry: Dict[Type, Dict[str, Type]] = defaultdict(dict)
+    default_implementation: str = None
+
     @classmethod
     def from_params(cls: Type[T], params: Params, **extras) -> T:
-        """
-        This is the automatic implementation of `from_params`. Any class that subclasses
-        `FromParams` (or `Registrable`, which itself subclasses `FromParams`) gets this
-        implementation for free. If you want your class to be instantiated from params in the
-        "obvious" way -- pop off parameters and hand them to your constructor with the same names --
-        this provides that functionality.
-
-        If you need more complex logic in your from `from_params` method, you'll have to implement
-        your own method that overrides this one.
-        """
-        # pylint: disable=protected-access
-        from nsds.common.registrable import Registrable  # import here to avoid circular imports
-
         logger.info(f"instantiating class {cls} from params {getattr(params, 'params', params)} "
                     f"and extras {extras}")
 
@@ -684,73 +617,28 @@ class FromParams:
         registered_subclasses = Registrable._registry.get(cls)
 
         if registered_subclasses is not None:
-            # We know ``cls`` inherits from Registrable, so we'll use a cast to make mypy happy.
-            # We have to use a disable to make pylint happy.
-            # pylint: disable=no-member
             as_registrable = cast(Type[Registrable], cls)
             default_to_first_choice = as_registrable.default_implementation is not None
             choice = params.pop_choice("type",
                                        choices=as_registrable.list_available(),
                                        default_to_first_choice=default_to_first_choice)
             subclass = registered_subclasses[choice]
-
-            # We want to call subclass.from_params. It's possible that it's just the "free"
-            # implementation here, in which case it accepts `**extras` and we are not able
-            # to make any assumptions about what extra parameters it needs.
-            #
-            # It's also possible that it has a custom `from_params` method. In that case it
-            # won't accept any **extra parameters and we'll need to filter them out.
             if not takes_arg(subclass.from_params, 'extras'):
-                # Necessarily subclass.from_params is a custom implementation, so we need to
-                # pass it only the args it's expecting.
                 extras = {k: v for k, v in extras.items() if takes_arg(subclass.from_params, k)}
 
             return subclass.from_params(params=params, **extras)
         else:
-            # This is not a base class, so convert our params and extras into a dict of kwargs.
-
             if cls.__init__ == object.__init__:
-                # This class does not have an explicit constructor, so don't give it any kwargs.
-                # Without this logic, create_kwargs will look at object.__init__ and see that
-                # it takes *args and **kwargs and look for those.
                 kwargs: Dict[str, Any] = {}
             else:
-                # This class has a constructor, so create kwargs for it.
                 kwargs = create_kwargs(cls, params, **extras)
-
-            return cls(**kwargs)  # type: ignore
-
-
-class Registrable(FromParams):
-    """
-    Any class that inherits from ``Registrable`` gains access to a named registry for its
-    subclasses. To register them, just decorate them with the classmethod
-    ``@BaseClass.register(name)``.
-
-    After which you can call ``BaseClass.list_available()`` to get the keys for the
-    registered subclasses, and ``BaseClass.by_name(name)`` to get the corresponding subclass.
-    Note that the registry stores the subclasses themselves; not class instances.
-    In most cases you would then call ``from_params(params)`` on the returned subclass.
-
-    You can specify a default by setting ``BaseClass.default_implementation``.
-    If it is set, it will be the first element of ``list_available()``.
-
-    Note that if you use this class to implement a new ``Registrable`` abstract class,
-    you must ensure that all subclasses of the abstract class are loaded when the module is
-    loaded, because the subclasses register themselves in their respective files. You can
-    achieve this by having the abstract class and all subclasses in the __init__.py of the
-    module in which they reside (as this causes any import of either the abstract class or
-    a subclass to load all other subclasses and the abstract class).
-    """
-    _registry: Dict[Type, Dict[str, Type]] = defaultdict(dict)
-    default_implementation: str = None
+            return cls(**kwargs)
 
     @classmethod
     def register(cls: Type[T], name: str):
         registry = Registrable._registry[cls]
 
         def add_subclass_to_registry(subclass: Type[T]):
-            # Add to registry, raise an error if key has already been used.
             if name in registry:
                 message = "Cannot register %s as %s; name already in use for %s" % (
                     name, cls.__name__, registry[name].__name__)
@@ -768,7 +656,6 @@ class Registrable(FromParams):
 
     @classmethod
     def list_available(cls) -> List[str]:
-        """List default first if it exists"""
         keys = list(Registrable._registry[cls].keys())
         default = cls.default_implementation
 
