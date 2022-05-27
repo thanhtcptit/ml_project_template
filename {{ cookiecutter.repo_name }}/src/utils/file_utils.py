@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import json
 
 
@@ -17,11 +18,13 @@ def load_txt(file_path):
         return data
 
 
-def load_dict(file_path):
+def load_dict(file_path, sep="\s+", skip_header=False):
     d = {}
     with open(file_path, encoding='utf-8') as f:
+        if skip_header:
+            f.readline()
         for line in f:
-            data = line.strip().split()
+            data = re.split(sep, line.strip())
             d[data[0]] = data[1]
     return d
 
@@ -45,10 +48,10 @@ def save_txt(file_path, data):
             f.write(str(item) + '\n')
 
 
-def save_dict(file_path, data):
+def save_dict(file_path, data, sep=","):
     with open(file_path, "w", encoding="utf-8") as f:
         for k, v in data.items():
-            f.write(f"{k},{v}\n")
+            f.write(f"{k}{sep}{v}\n")
 
 
 def save_json(file_path, data):

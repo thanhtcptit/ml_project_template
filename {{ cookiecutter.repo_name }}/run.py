@@ -113,15 +113,11 @@ class Evaluate(Subcommand):
                                           help=description)
 
         subparser.add_argument(
-            "dataset_path", type=str,
-            help="path to evaluate dataset")
-        subparser.add_argument(
             "checkpoint_path", type=str,
             help=("path to the model checkpoint"))
         subparser.add_argument(
-            "-f", "--force", action="store_true",
-            help="force override evaluate result")
-
+            "dataset_path", type=str,
+            help="path to evaluate dataset")
         subparser.set_defaults(func=evaluate_model)
         return subparser
 

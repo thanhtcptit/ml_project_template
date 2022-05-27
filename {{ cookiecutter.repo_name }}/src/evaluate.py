@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
 
 
-def main(dataset_path, checkpoint_path, force=False):
+def eval(checkpoint_path, dataset_path):
     raise NotImplementedError()
