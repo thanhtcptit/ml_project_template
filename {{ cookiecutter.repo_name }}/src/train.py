@@ -1,12 +1,21 @@
-# -*- coding: utf-8 -*-
 import os
 import shutil
 
-from src.evaluate import eval 
-from src.utils import Params, save_json, save_txt
+from src.utils import Params, save_json, save_txt, load_json, Logger
 
 
 def train(config_path, checkpoint_dir, recover=True, force=False):
+    if os.path.exists(checkpoint_dir):
+        if force:
+            shutil.rmtree(checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    logger = Logger(os.path.join(checkpoint_dir, "log"))
+
+    config = load_json(config_path)
+
+
+def eval(checkpoint_path, dataset_path):
     raise NotImplementedError()
 
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import re
 import json
@@ -18,7 +17,7 @@ def load_txt(file_path):
         return data
 
 
-def load_dict(file_path, sep="\s+", skip_header=False):
+def load_dict(file_path, sep=",", skip_header=False):
     d = {}
     with open(file_path, encoding='utf-8') as f:
         if skip_header:
@@ -55,6 +54,8 @@ def save_dict(file_path, data, sep=","):
 
 
 def save_json(file_path, data):
+    if not isinstance(data, list):
+        data = [data]
     with open(file_path, 'w') as f:
         for item in data:
             strs = json.dumps(item)

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from src.utils.params import Registrable
 
 
@@ -12,5 +11,3 @@ class BaseModel(Registrable):
     def build_graph(self):
         raise NotImplementedError()
 
-    def optimizer(self):
-        raise NotImplementedError()
