@@ -90,5 +90,7 @@ target/
 
 .xenv
 
+/train_logs/*
+
 # exclude
 !/data/*/.gitkeep
