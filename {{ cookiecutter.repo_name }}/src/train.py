@@ -8,6 +8,8 @@ def train(config_path, checkpoint_dir, recover=True, force=False):
     if os.path.exists(checkpoint_dir):
         if force:
             shutil.rmtree(checkpoint_dir)
+        elif not recover:
+            raise ValueError(f"{checkpoint_dir} already exists!")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     logger = Logger(os.path.join(checkpoint_dir, "log"))
