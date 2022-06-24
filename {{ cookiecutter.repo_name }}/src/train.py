@@ -1,84 +1,78 @@
 import os
 import shutil
 
-from src.utils import Params, save_json, save_txt, load_json, Logger
+from pprint import pprint
+
+from src.utils import Params, save_json, save_txt, load_json, Logger, get_current_time_str
 
 
 def train(config_path, checkpoint_dir, recover=True, force=False):
+    config = Params.from_file(config_path)
+    pprint(config.as_dict())
+
+    if not checkpoint_dir:
+        config_name = os.path.splitext(os.path.basename(config_path))[0]
+        checkpoint_dir = os.path.join("train_logs", config_name)
     if os.path.exists(checkpoint_dir):
         if force:
             shutil.rmtree(checkpoint_dir)
         elif not recover:
             raise ValueError(f"{checkpoint_dir} already exists!")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    shutil.copy(config_path, os.path.join(checkpoint_dir, "config.json"))
+    print("Train log: ", checkpoint_dir)
 
-    logger = Logger(os.path.join(checkpoint_dir, "log"))
-
-    config = load_json(config_path)
+    logger = Logger(os.path.join(checkpoint_dir, "log"), stdout=True)
 
 
-def eval(checkpoint_path, dataset_path):
+def test(checkpoint_path, dataset_path):
     raise NotImplementedError()
 
 
-def hyperparams_search(config_file, force=False):
-    config_file_name = os.path.splitext(os.path.split(config_file)[1])[0]
-    config = Params.from_file(config_file)
-    hyp = config["hyp"]
+def hyperparams_search(config_file, dataset_path, num_trials=50, force=False):
+    import optuna
 
-    num_hyp = len(hyp)
-    inds = [0] * num_hyp
-    keys_list = []
-    values_list = []
-    len_search = []
-    for k, v in hyp.items():
-        keys_list.append(k)
-        values_list.append(v)
-        len_search.append(len(v))
+    def objective(trial):        
+        config_name = os.path.splitext(os.path.basename(config_file))[0]
+        config = load_json(config_file)
+        hyp_config = config["hyp"]
+        for k, v in hyp_config.items():
+            k_list = k.split(".")
+            d = config
+            for i in range(len(k_list) - 1):
+                d = d[k_list[i]]
+            if v["type"] == "int":
+                val = trial.suggest_int(k, v["range"][0], v["range"][1])
+            elif v["type"] == "float":
+                val = trial.suggest_float(k, v["range"][0], v["range"][1], log=v.get("log", False))
+            elif v["type"] == "categorical":
+                val = trial.suggest_categorical(k, v["values"])
+            d[k_list[-1]] = val
+            config_name += f"_{k_list[-1]}-{val}"
 
-    best_metric = 0
-    best_model_dir = ""
-    saved_model_list = []
-    i = 0
-    name = []
-    while True:
-        if inds[i] == len_search[i]:
-            if i == 0:
-                break
-            inds[i] = 0
-            i -= 1
-            name.pop()
-            continue
+        config.pop("hyp")
+        checkpoint_dir = f"/tmp/{config_name}"
+        trial_config_file = os.path.join(f"/tmp/hyp_{get_current_time_str()}.json")
+        save_json(trial_config_file, config)
 
-        if i == 0:
-            name = []
-        main_key, sub_key = keys_list[i].split(".")
-        values = values_list[i][inds[i]]
-        config[main_key][sub_key] = values
-        inds[i] += 1
-        name.append(sub_key + "-" + str(values))
-        if i == num_hyp - 1:
-            print(config.__dict__["params"])
-            config_path = os.path.join("/tmp", config_file_name + '_' + '_'.join(name) + ".json")
-            name.pop()
-            save_json(config_path, config.__dict__["params"])
+        best_val = train(trial_config_file, checkpoint_dir, force=force)
+        if dataset_path:
+            best_val = test(checkpoint_dir, dataset_path)
+        return best_val
 
-            model_dir = train()
-            saved_model_list.append(model_dir)
+    study = optuna.create_study(study_name="hyp", direction="maximize")
+    study.optimize(objective, n_trials=num_trials, gc_after_trial=True,
+                   catch=(tf.errors.InvalidArgumentError,))
+    print("Number of finished trials: ", len(study.trials))
 
-            metric = eval()
-            save_txt(os.path.join(model_dir, "res.txt"), [metric])
-            if metric > best_metric:
-                best_metric = metric
-                best_model_dir = model_dir
-        else:
-            i += 1
+    df = study.trials_dataframe()
+    print(df)
 
-    print("============================================")
-    print("Best results: ", best_metric)
-    print(best_model_dir + "\n\n")
+    print("Best trial:")
+    trial = study.best_trial
 
-    for d in saved_model_list:
-        if d == best_model_dir:
-            continue
-        shutil.rmtree(d)
+    print(" - Value: ", trial.value)
+    print(" - Params: ")
+    for key, value in trial.params.items():
+        print("  - {}: {}".format(key, value))
+
