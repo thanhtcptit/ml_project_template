@@ -1,38 +1,44 @@
 import os
 import shutil
 
+from tqdm import tqdm
 from pprint import pprint
 
-from src.utils import Params, save_json, save_txt, load_json, Logger, get_current_time_str
+from src.utils import *
 
 
-def train(config_path, checkpoint_dir, recover=True, force=False):
+def train(config_path, dataset_path, checkpoint_dir, recover=True, force=False):
     config = Params.from_file(config_path)
+    config["dataset_path"] = dataset_path
     pprint(config.as_dict())
 
     if not checkpoint_dir:
+        dataset_name = get_basename(dataset_path)
         config_name = os.path.splitext(os.path.basename(config_path))[0]
-        checkpoint_dir = os.path.join("train_logs", config_name)
+        checkpoint_dir = os.path.join("train_logs", dataset_name, config_name)
     if os.path.exists(checkpoint_dir):
         if force:
             shutil.rmtree(checkpoint_dir)
-        elif not recover:
-            raise ValueError(f"{checkpoint_dir} already exists!")
+        else:
+            raise ValueError(f"{checkpoint_dir} already existed")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    shutil.copy(config_path, os.path.join(checkpoint_dir, "config.json"))
+    save_json(os.path.join(checkpoint_dir, "config.json"), config.as_dict())
     print("Train log: ", checkpoint_dir)
 
-    logger = Logger(os.path.join(checkpoint_dir, "log"), stdout=True)
+    logger = Logger(os.path.join(checkpoint_dir, "log.txt"), stdout=True)
 
 
-def test(checkpoint_path, dataset_path):
-    raise NotImplementedError()
+def test(checkpoint_dir, test_dataset_path):
+    config = Params.from_file(os.path.join(checkpoint_dir, "config.json"))
+
+    return 1
 
 
-def hyperparams_search(config_file, dataset_path, num_trials=50, force=False):
+def hyperparams_search(config_file, dataset_path, test_dataset_path, num_trials=50, force=False):
     import optuna
 
-    def objective(trial):        
+    def objective(trial):
+        dataset_name = get_basename(dataset_path)    
         config_name = os.path.splitext(os.path.basename(config_file))[0]
         config = load_json(config_file)
         hyp_config = config["hyp"]
@@ -51,13 +57,13 @@ def hyperparams_search(config_file, dataset_path, num_trials=50, force=False):
             config_name += f"_{k_list[-1]}-{val}"
 
         config.pop("hyp")
-        checkpoint_dir = f"/tmp/{config_name}"
+        checkpoint_dir = f"/tmp/{dataset_name}/{config_name}"
         trial_config_file = os.path.join(f"/tmp/hyp_{get_current_time_str()}.json")
         save_json(trial_config_file, config)
 
-        best_val = train(trial_config_file, checkpoint_dir, force=force)
-        if dataset_path:
-            best_val = test(checkpoint_dir, dataset_path)
+        best_val = train(trial_config_file, dataset_path, checkpoint_dir, force=force)
+        if test_dataset_path:
+            best_val = test(checkpoint_dir, test_dataset_path)
         return best_val
 
     study = optuna.create_study(study_name="hyp", direction="maximize")
