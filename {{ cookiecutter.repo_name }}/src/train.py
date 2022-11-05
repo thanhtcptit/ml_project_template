@@ -68,7 +68,7 @@ def hyperparams_search(config_file, dataset_path, test_dataset_path, num_trials=
 
     study = optuna.create_study(study_name="hyp", direction="maximize")
     study.optimize(objective, n_trials=num_trials, gc_after_trial=True,
-                   catch=(tf.errors.InvalidArgumentError,))
+                   catch=())
     print("Number of finished trials: ", len(study.trials))
 
     df = study.trials_dataframe()

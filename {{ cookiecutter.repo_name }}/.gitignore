@@ -90,6 +90,8 @@ target/
 
 .xenv
 
+*.tmp
+
 /train_logs/*
 
 # exclude
